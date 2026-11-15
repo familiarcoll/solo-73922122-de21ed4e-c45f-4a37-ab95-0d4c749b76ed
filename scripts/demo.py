@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sqlite3
 import sys
 import time
 import urllib.error
@@ -313,6 +314,96 @@ def cmd_restart_check(args) -> None:
     section("restart-check 全部断言通过 ✔")
 
 
+# ---------------------------------------------------------------- 完整性巡检
+
+def cmd_inspect_demo(args) -> None:
+    """演示完整性巡检：完好 -> 篡改(mismatch) -> 丢失(missing) -> 恢复(intact)。
+
+    直接在挂载卷里改写/删除正式 Parquet 来模拟“被误改或丢失”，
+    巡检只读核验、不修复，结论通过 API 逐文件返回。
+    """
+    cli = Client(args.base)
+    db_path = os.path.join(DATA_DIR, "meta", "lakehouse.db")
+
+    def wait_inspection(iid: int) -> dict:
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            _, data = cli.call("GET", f"/inspections/{iid}")
+            if data["state"] in ("completed", "failed"):
+                return data
+            time.sleep(0.2)
+        raise AssertionError(f"巡检 {iid} 未在预期时间内完成")
+
+    def physical_path(file_uid: str) -> str:
+        conn = sqlite3.connect(db_path)
+        try:
+            row = conn.execute(
+                "SELECT path FROM files WHERE file_id=?", (file_uid,)
+            ).fetchone()
+        finally:
+            conn.close()
+        assert row is not None, f"登记中找不到文件 {file_uid}"
+        return row[0]
+
+    section("完整性巡检演示")
+    # 上传一份全新的已知完好文件，保证演示基线不依赖环境里既有文件的状态
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    fresh_dir = os.path.join(DATA_DIR, "inspect-demo")
+    os.makedirs(fresh_dir, exist_ok=True)
+    fresh_path = os.path.join(fresh_dir, "probe.parquet")
+    table = pa.table({
+        "station_id": pa.array(["PROBE-1", "PROBE-2"], pa.string()),
+        "observed_at": pa.array(
+            [pa.scalar(1_000_000 + i, type=pa.timestamp("us", tz="UTC")).as_py()
+             for i in range(2)], pa.timestamp("us", tz="UTC")),
+        "temperature": pa.array([21.5, 22.5], pa.float64()),
+    })
+    pq.write_table(table, fresh_path, compression="snappy")
+    target = cli.upload(fresh_path)
+    uid = target["file_id"]
+    path = physical_path(uid)
+    original_bytes = open(path, "rb").read()
+    print(f"  目标文件: {os.path.basename(path)}  登记指纹: {target['sha256'][:16]}…")
+
+    # 1) 干净基线：完好
+    iid = cli.call("POST", "/inspections", b"{}")[1]["inspection_id"]
+    insp = wait_inspection(iid)
+    base = next(f for f in insp["files"] if f["file_id"] == uid)
+    print(f"  基线巡检 #{iid}: {base['status']}（{base['status_text']}）")
+    assert base["status"] == "intact"
+
+    # 2) 篡改正式产物：内容不符
+    with open(path, "r+b") as fh:
+        fh.seek(0)
+        fh.write(b"TAMPERED-BYTES")
+    iid = cli.call("POST", "/inspections", b"{}")[1]["inspection_id"]
+    insp = wait_inspection(iid)
+    hit = next(f for f in insp["files"] if f["file_id"] == uid)
+    print(f"  篡改后巡检 #{iid}: {hit['status']}（{hit['status_text']}）"
+          f"  实际指纹={hit['actual_sha256'][:16]}…")
+    assert hit["status"] == "mismatch"
+
+    # 3) 删除磁盘文件、保留登记：缺失
+    os.remove(path)
+    iid = cli.call("POST", "/inspections", b"{}")[1]["inspection_id"]
+    insp = wait_inspection(iid)
+    hit = next(f for f in insp["files"] if f["file_id"] == uid)
+    print(f"  删除后巡检 #{iid}: {hit['status']}（{hit['status_text']}）")
+    assert hit["status"] == "missing"
+
+    # 4) 恢复原始字节：重新完好（演示巡检只核验、不阻断业务）
+    with open(path, "wb") as fh:
+        fh.write(original_bytes)
+    iid = cli.call("POST", "/inspections", b"{}")[1]["inspection_id"]
+    insp = wait_inspection(iid)
+    hit = next(f for f in insp["files"] if f["file_id"] == uid)
+    print(f"  恢复后巡检 #{iid}: {hit['status']}（{hit['status_text']}）")
+    assert hit["status"] == "intact"
+    print(f"  本次巡检汇总: {json.dumps(insp['summary'], ensure_ascii=False)}")
+    section("inspect-demo 全部断言通过 ✔")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="湖仓合并服务演示客户端")
     ap.add_argument("--base", default=DEFAULT_BASE)
@@ -325,6 +416,7 @@ def main() -> None:
 
     sub.add_parser("fail-demo").set_defaults(func=cmd_fail_demo)
     sub.add_parser("restart-check").set_defaults(func=cmd_restart_check)
+    sub.add_parser("inspect-demo").set_defaults(func=cmd_inspect_demo)
 
     args = ap.parse_args()
     try:

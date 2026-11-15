@@ -8,7 +8,7 @@ import uuid
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse
 
-from . import config, cursors, storage
+from . import config, cursors, inspections, storage
 from .db import LOCK, get_conn, next_file_seq
 from .merger import MergeConflict, manager
 from .storage import ParquetValidationError
@@ -21,8 +21,11 @@ async def lifespan(_app: FastAPI):
     _app.state.recovery = manager.recover_on_startup(
         auto_merge=config.AUTO_MERGE_ON_START
     )
+    # 中断在 running 的巡检标记 failed，并自动重新发起一次
+    _app.state.inspection_recovery = inspections.manager.recover_on_startup()
     yield
-    # 关停：等待后台合并线程退出
+    # 关停：等待后台合并/巡检线程退出
+    inspections.manager.shutdown(timeout=5)
     for t in list(manager._threads.values()):  # noqa: SLF001
         t.join(timeout=5)
 
@@ -56,9 +59,18 @@ def _cursor_handler(_request: Request, exc: cursors.CursorError):
     return JSONResponse(status_code=404, content={"detail": str(exc)})
 
 
+@app.exception_handler(inspections.InspectionNotFound)
+def _inspection_handler(_request: Request, exc: inspections.InspectionNotFound):
+    return JSONResponse(status_code=404, content={"detail": str(exc)})
+
+
 @app.get("/health", tags=["meta"], summary="健康检查与启动恢复结果")
 def health() -> dict:
-    return {"status": "ok", "recovery": getattr(app.state, "recovery", None)}
+    return {
+        "status": "ok",
+        "recovery": getattr(app.state, "recovery", None),
+        "inspection_recovery": getattr(app.state, "inspection_recovery", None),
+    }
 
 
 # ------------------------------- 上传 -------------------------------
@@ -96,6 +108,9 @@ async def upload_parquet(request: Request) -> dict:
 
     # CPU/IO 部分在线程池外直接做（单进程，锁内时间很短）
     table, row_count, tmp_path = storage.validate_and_stage(data)
+    # 指纹在登记前、数据库锁外对规范化后的正式产物流式计算，
+    # 不长期占住 SQLite 写锁，期间其他上传/分页可继续提交
+    file_sha256 = storage.sha256_file(tmp_path)
 
     conn = get_conn()
     with LOCK:
@@ -113,10 +128,11 @@ async def upload_parquet(request: Request) -> dict:
         try:
             conn.execute(
                 """INSERT INTO files
-                   (file_id, kind, path, size_bytes, row_count, seq_order,
+                   (file_id, kind, path, size_bytes, sha256, row_count, seq_order,
                     read_order, status)
-                   VALUES (?, 'upload', ?, ?, ?, ?, ?, 'active')""",
-                (file_uid, final_path, size, row_count, seq, read_order),
+                   VALUES (?, 'upload', ?, ?, ?, ?, ?, ?, 'active')""",
+                (file_uid, final_path, size, file_sha256, row_count, seq,
+                 read_order),
             )
             conn.commit()
         except Exception:
@@ -130,6 +146,7 @@ async def upload_parquet(request: Request) -> dict:
         "seq_order": seq,
         "read_order": read_order,
         "size_bytes": size,
+        "sha256": file_sha256,
         "row_count": row_count,
         "columns": list(table.column_names),
         "status": "active",
@@ -141,8 +158,8 @@ def list_files() -> dict:
     conn = get_conn()
     with LOCK:
         rows = conn.execute(
-            """SELECT id, file_id, kind, path, size_bytes, row_count, seq_order,
-                      read_order, status, created_at, obsolete_at
+            """SELECT id, file_id, kind, path, size_bytes, sha256, row_count,
+                      seq_order, read_order, status, created_at, obsolete_at
                FROM files ORDER BY read_order, seq_order"""
         ).fetchall()
     return {
@@ -153,6 +170,7 @@ def list_files() -> dict:
                 "file_name": os.path.basename(r["path"]),
                 "kind": r["kind"],
                 "size_bytes": r["size_bytes"],
+                "sha256": r["sha256"],
                 "row_count": r["row_count"],
                 "seq_order": r["seq_order"],
                 "read_order": r["read_order"],
@@ -233,6 +251,50 @@ def resume_merge() -> dict:
 @app.post("/merges/reclaim", tags=["merge"], summary="立即回收无游标引用的 obsolete 文件")
 def reclaim_now() -> dict:
     return manager.reclaim()
+
+
+# ------------------------------ 完整性巡检 ------------------------------
+
+@app.post(
+    "/inspections",
+    tags=["inspection"],
+    summary="发起完整性巡检（受理时固定活动文件清单，后台逐个核验 SHA-256）",
+    status_code=202,
+)
+def start_inspection() -> dict:
+    """受理瞬间把当时所有 active 文件快照固定下来，后台线程逐文件核验。
+
+    每个文件返回一种结论：
+
+    - ``intact`` 完好：磁盘文件 SHA-256 与登记指纹一致；
+    - ``mismatch`` 内容不符：指纹不一致，正式产物疑似被篡改；
+    - ``missing`` 缺失：登记行仍在但磁盘文件丢失；
+    - ``unverified`` 未核验：旧文件已登记但没有指纹，不能报完好；
+    - ``reclaimed`` 合法回收：巡检期间合并切换/旧件回收删除了登记行，
+      不属于缺失。
+
+    哈希在 SQLite 写锁之外流式计算，巡检期间上传与游标分页可继续；
+    巡检引用不建外键，任何情况下都不会阻碍旧件回收。
+    """
+    return inspections.manager.start_inspection()
+
+
+@app.get(
+    "/inspections",
+    tags=["inspection"],
+    summary="列出全部巡检任务及其状态",
+)
+def list_inspections() -> dict:
+    return inspections.manager.list_inspections()
+
+
+@app.get(
+    "/inspections/{inspection_id}",
+    tags=["inspection"],
+    summary="查看某次巡检的逐文件核验结果",
+)
+def get_inspection(inspection_id: int) -> dict:
+    return inspections.manager.get_inspection(inspection_id)
 
 
 @app.post(

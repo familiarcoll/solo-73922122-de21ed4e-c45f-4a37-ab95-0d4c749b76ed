@@ -136,4 +136,7 @@ print('现用文件均未被误删')
 section "E. 故障注入演示（stream / switch 失败保留原数据）"
 $EXEC python scripts/demo.py fail-demo
 
+section "F. 完整性巡检演示（完好 / 内容不符 / 缺失 / 恢复）"
+$EXEC python scripts/demo.py inspect-demo
+
 section "全部演示完成 ✔  Swagger 文档: http://localhost:8000/docs"

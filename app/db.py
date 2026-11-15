@@ -45,6 +45,9 @@ def init() -> sqlite3.Connection:
                 kind         TEXT NOT NULL CHECK (kind IN ('upload', 'merged')),
                 path         TEXT NOT NULL,
                 size_bytes   INTEGER NOT NULL,
+                -- 正式产物字节的 SHA-256（hex）；历史登记行可能为 NULL，
+                -- 巡检时 NULL 指纹只能报“未核验”，不得报完好
+                sha256       TEXT,
                 row_count    INTEGER NOT NULL,
                 seq_order    INTEGER NOT NULL UNIQUE,
                 -- 全局读取顺序：合并产物继承其输入的最早位置，
@@ -102,12 +105,51 @@ def init() -> sqlite3.Connection:
                 PRIMARY KEY (cursor_id, file_id)
             );
 
+            -- 完整性巡检任务：受理瞬间固定当时的 active 文件清单
+            CREATE TABLE IF NOT EXISTS inspections (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                state        TEXT NOT NULL CHECK (state IN ('running', 'completed', 'failed')),
+                error        TEXT,
+                created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                finished_at  TEXT
+            );
+
+            -- 巡检受理时的活动文件快照。
+            -- 刻意不建指向 files 的外键：巡检失败或中断时，这些引用绝不能
+            -- 阻碍旧件回收（files 行被回收删除后，快照行仍保留以便回看）。
+            CREATE TABLE IF NOT EXISTS inspection_files (
+                inspection_id  INTEGER NOT NULL REFERENCES inspections(id) ON DELETE CASCADE,
+                file_pk        INTEGER NOT NULL,
+                file_uid       TEXT NOT NULL,
+                file_name      TEXT NOT NULL,
+                path           TEXT NOT NULL,
+                kind           TEXT NOT NULL,
+                expected_sha256 TEXT,
+                actual_sha256  TEXT,
+                -- intact 完好 / mismatch 内容不符 / missing 缺失 /
+                -- unverified 已登记但无指纹 / reclaimed 合法回收（切换或旧件回收）
+                status         TEXT NOT NULL CHECK (status IN (
+                                 'pending', 'intact', 'mismatch',
+                                 'missing', 'unverified', 'reclaimed', 'error')),
+                detail         TEXT,
+                position       INTEGER NOT NULL,
+                PRIMARY KEY (inspection_id, file_pk)
+            );
+
             CREATE INDEX IF NOT EXISTS idx_files_status ON files(status);
             CREATE INDEX IF NOT EXISTS idx_files_read_order
                 ON files(read_order, seq_order);
             CREATE INDEX IF NOT EXISTS idx_cursors_closed ON cursors(closed);
+            CREATE INDEX IF NOT EXISTS idx_inspection_files
+                ON inspection_files(inspection_id, position);
             """
         )
+        # 旧库迁移：为 files 补 sha256 列（历史行指纹为 NULL，巡检报 unverified）
+        existing_cols = {
+            r["name"] for r in conn.execute("PRAGMA table_info(files)").fetchall()
+        }
+        if "sha256" not in existing_cols:
+            conn.execute("ALTER TABLE files ADD COLUMN sha256 TEXT")
         conn.execute(
             "INSERT OR IGNORE INTO settings(key, value) VALUES ('file_seq', 0)"
         )

@@ -1,6 +1,7 @@
 """Parquet 读写：上传校验/规范化、分页读取、流式合并。"""
 from __future__ import annotations
 
+import hashlib
 import os
 import uuid
 from typing import Iterator
@@ -11,6 +12,25 @@ import pyarrow.parquet as pq
 from . import config
 
 REQUIRED_COLUMNS = ("station_id", "observed_at", "temperature")
+
+# 流式哈希的读取块大小（1 MiB），内存占用与文件大小无关
+_HASH_CHUNK = 1024 * 1024
+
+
+def sha256_file(path: str) -> str:
+    """对磁盘文件做流式 SHA-256，返回 hex 摘要。
+
+    纯读操作、不触碰数据库锁：巡检/登记前的哈希计算可以与上传写事务、
+    游标分页写事务并发执行，不会长期占住 SQLite 写锁。
+    """
+    digest = hashlib.sha256()
+    with open(path, "rb") as fh:
+        while True:
+            chunk = fh.read(_HASH_CHUNK)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 class ParquetValidationError(ValueError):

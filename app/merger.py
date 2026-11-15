@@ -230,8 +230,13 @@ class MergeManager:
 
             # 完整性校验通过后才允许切换
             storage.verify_output(tmp_path, total_rows)
+            # 对正式合并产物计算 SHA-256：纯读、在数据库写锁之外，
+            # 与文件登记在后续同一事务里提交，避免长期占住写锁
+            output_sha256 = storage.sha256_file(tmp_path)
             try:
-                self._finish_switch(merge_id, tmp_path, total_rows)
+                self._finish_switch(
+                    merge_id, tmp_path, total_rows, output_sha256
+                )
             except RuntimeError as exc:
                 # 切换阶段（含故障注入）失败：原输入文件保持 active
                 self._mark_failed(merge_id, "switch", exc, tmp_path)
@@ -240,7 +245,8 @@ class MergeManager:
             self._mark_failed(merge_id, "merge", exc, tmp_path)
 
     def _finish_switch(
-        self, merge_id: int, tmp_path: str, total_rows: int
+        self, merge_id: int, tmp_path: str, total_rows: int,
+        output_sha256: str,
     ) -> None:
         conn = get_conn()
         with LOCK:
@@ -275,10 +281,11 @@ class MergeManager:
             try:
                 conn.execute(
                     """INSERT INTO files
-                       (file_id, kind, path, size_bytes, row_count, seq_order,
-                        read_order, status)
-                       VALUES (?, 'merged', ?, ?, ?, ?, ?, 'active')""",
-                    (file_uid, final_path, size, total_rows, seq, min_read_order),
+                       (file_id, kind, path, size_bytes, sha256, row_count,
+                        seq_order, read_order, status)
+                       VALUES (?, 'merged', ?, ?, ?, ?, ?, ?, 'active')""",
+                    (file_uid, final_path, size, output_sha256, total_rows,
+                     seq, min_read_order),
                 )
                 conn.execute(
                     "UPDATE files SET status='obsolete', obsolete_at=? "

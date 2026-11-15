@@ -15,6 +15,10 @@ Parquet 小文件合并为单个 Parquet，降低下游分析的文件打开开�
 | 完整结果才可切换，失败保留原数据 | 先做行数 + 完整重读 + 列结构校验，通过后在单个 SQLite 事务里原子切换；任何失败输入文件始终 `active`，tmp 自动清理 |
 | 旧文件等游标读完或关闭后才回收 | 旧文件转 `obsolete`；回收 SQL 用 `NOT EXISTS` 校验没有任何未关闭游标引用，读取在同一把进程锁内完成，不会与删除竞争 |
 | 切换/回收中退出，重启后可恢复 | 启动恢复：清理 tmp 半成品；`switching` 任务（事务未提交）标记 failed 且原数据完好；`running/paused` 任务重起后台线程续跑；继续回收无引用旧文件；active 文件永不删除 |
+| 正式产物 SHA-256 指纹随登记同事务提交 | 上传与合并在数据库写锁**之外**对流式产物计算 SHA-256，指纹与文件登记在同一事务写入 `files.sha256`；哈希期间上传与游标分页可继续 |
+| 完整性巡检受理即固定活动清单 | `POST /inspections` 事务内快照当时全部 active 文件，后台逐文件重算 SHA-256，返回完好/内容不符/缺失/未核验/合法回收 |
+| 旧文件无指纹不得报完好 | 历史登记行 `sha256` 为 NULL 时巡检结论为 `unverified`，绝不计入 `intact` |
+| 合法回收不误报缺失、巡检不阻碍回收 | 巡检快照表不建指向 `files` 的外键；登记行被合并切换/旧件回收删除时报 `reclaimed`，与登记仍在但磁盘丢失的 `missing` 严格区分 |
 
 数据与元数据全部落在挂载卷 `/data`：
 
@@ -50,6 +54,23 @@ open http://localhost:8000/docs
 | `POST /merges/pause` / `/resume` | 暂停/恢复合并（演示用） |
 | `POST /merges/reclaim` | 立即回收无游标引用的 obsolete 文件 |
 | `POST /merges/fail-inject/{stream|switch}` | 演示用故障注入，验证失败保留原数据 |
+| `POST /inspections` | 发起完整性巡检（202；受理时固定活动文件清单，后台逐个核验 SHA-256） |
+| `GET  /inspections` | 全部巡检任务及状态 |
+| `GET  /inspections/{id}` | 某次巡检的逐文件结论：`intact/mismatch/missing/unverified/reclaimed` |
+
+### 巡检结论含义
+
+| 状态 (`status`) | 中文 | 判定条件 |
+| --- | --- | --- |
+| `intact` | 完好 | 磁盘文件存在，重算 SHA-256 与登记指纹一致 |
+| `mismatch` | 内容不符 | 磁盘文件存在，但指纹不一致（正式 Parquet 被误改） |
+| `missing` | 缺失 | 文件登记行仍在，磁盘文件却不存在（正式产物丢失） |
+| `unverified` | 未核验 | 历史文件已登记但没有指纹（`sha256 IS NULL`），不能报完好 |
+| `reclaimed` | 合法回收 | 巡检期间合并切换或旧件回收合法删除了登记行，**不是缺失** |
+
+在 `/docs` 展开 `POST /inspections` → `Try it out` → `Execute` 受理巡检，
+再用返回的 `inspection_id` 调 `GET /inspections/{id}` 查看每个文件的结论与
+期望/实际指纹。
 
 ## 一键端到端演示
 
@@ -85,7 +106,7 @@ DATA_DIR=$DATA_DIR python scripts/demo.py fail-demo
 
 ```bash
 pip install -r requirements.txt pytest
-pytest            # 9 个用例：校验/分页边界/快照/合并/回收/故障/重启恢复
+pytest            # 18 个用例：校验/分页/快照/合并/回收/故障/重启恢复 + 完整性巡检
 ```
 
 ## 关键设计说明
